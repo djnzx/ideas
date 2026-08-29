@@ -5,7 +5,11 @@ organization := "io.jnz"
 
 // Releases are cut from a branch named X.Y.Z; the release workflow passes that
 // through as RELEASE_VERSION. Everything else is a snapshot.
-version := sys.env.getOrElse("RELEASE_VERSION", "0.1.0-SNAPSHOT")
+//
+// `.filter(_.nonEmpty)` matters: the workflow validates non-release merges too, and
+// there RELEASE_VERSION is set to the empty string rather than left unset. A plain
+// getOrElse would hand back "" and the build would carry an empty version.
+version := sys.env.get("RELEASE_VERSION").filter(_.nonEmpty).getOrElse("0.1.0-SNAPSHOT")
 
 // GitHub Packages. Credentials come from the workflow's GITHUB_TOKEN.
 publishTo := Some(MavenRepository("GitHub Packages", "https://maven.pkg.github.com/djnzx/ideas"))

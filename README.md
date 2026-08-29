@@ -824,19 +824,38 @@ manual publish step and **no PAT anywhere in the process** — GitHub Actions' o
 1. Branch off `master` with a name that is exactly `X.Y.Z` — `0.1.2`, not
    `v0.1.2` and not `release/0.1.2`. The name *is* the version.
 2. Open a PR into `master` and merge it.
-3. On merge, `.github/workflows/release.yml` checks the branch name against
-   `^[0-9]+\.[0-9]+\.[0-9]+$`. Any other name and the job no-ops, so ordinary
-   feature branches merge without releasing anything.
-4. It then refuses if tag `vX.Y.Z` already exists, runs `sbt validate`
-   (scalafmt check + full test suite), publishes with `RELEASE_VERSION` set,
-   tags the merge commit `vX.Y.Z`, and deletes the release branch.
+3. On merge, `.github/workflows/release.yml` runs `sbt validate` (scalafmt check +
+   full test suite) on the merge commit — **every** merge, whatever the branch was
+   called.
+4. It then checks the branch name against `^[0-9]+\.[0-9]+\.[0-9]+$`. Any other name
+   and it stops there, validated but unreleased. A matching name refuses if tag
+   `vX.Y.Z` already exists, publishes with `RELEASE_VERSION` set, tags the merge
+   commit `vX.Y.Z`, and deletes the release branch.
 
-Two safety properties worth preserving if you edit that workflow: `version` falls
-back to `0.1.0-SNAPSHOT` when `RELEASE_VERSION` is unset, and the `release` task
-fails outright rather than publishing a snapshot — so a misconfigured workflow
-errors instead of quietly shipping `0.1.0-SNAPSHOT` as a release. And publish
-happens *before* tagging, on the reasoning that a missing tag is easier to repair
-by hand than a tag pointing at something that was never published.
+Which workflow builds what:
+
+| Event | Runs |
+|---|---|
+| Push to any branch except `master` | `CI` → validate |
+| Merge into `master` from `X.Y.Z` | `Release` → validate + publish + tag |
+| Merge into `master` from any other branch | `Release` → validate only |
+
+`master` is deliberately excluded from `CI`'s push trigger. Without that exclusion
+both workflows fire on a merge and compile the identical tree twice in parallel.
+The flip side: a *direct* push to `master` is validated by nothing, so protect the
+branch and require pull requests.
+
+Three properties worth preserving if you edit that workflow:
+
+- `version` falls back to `0.1.0-SNAPSHOT` when `RELEASE_VERSION` is unset **or
+  empty** — the empty case is real, since non-release merges pass an empty string.
+- The `release` task fails outright rather than publishing a snapshot, so a
+  misconfigured workflow errors instead of quietly shipping `0.1.0-SNAPSHOT`.
+- Publish happens *before* tagging: a missing tag is easier to repair by hand than
+  a tag pointing at something that was never published.
+
+`validate` and `release` are two steps of one job on one runner, sharing one sbt
+server — so publishing does not recompile what validation just built.
 
 ### Publishing from your machine
 

@@ -1,10 +1,14 @@
 name: CI
 
-# Every commit on every branch. `branches: ['**']` matches nested names like
-# `feature/foo` while leaving tag pushes alone.
+# Every commit on every branch except master. `branches-ignore` matches nested names
+# like `feature/foo` while leaving tag pushes alone.
+#
+# master is excluded deliberately: it only changes through merged PRs, and release.yml
+# validates every merge commit. Without this exclusion the same tree gets compiled and
+# tested twice in parallel on every merge -- once here, once there.
 on:
   push:
-    branches: ['**']
+    branches-ignore: ['master']
 
 # A newer commit on the same branch supersedes an in-flight run.
 concurrency:

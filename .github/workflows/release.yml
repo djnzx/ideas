@@ -1,7 +1,13 @@
 name: Release
 
-# Fires when a PR is merged. Only branches named exactly X.Y.Z release;
-# everything else merges normally and this job no-ops.
+# Fires when a PR into master is merged, and covers two cases:
+#
+#   - branch named exactly X.Y.Z -> validate, publish, tag, delete the branch
+#   - any other branch name      -> validate only
+#
+# The validate step is therefore NOT gated on the branch name. master is excluded from
+# scala-ci.yml's push trigger, so this job is the only thing that ever sees a merge
+# commit -- gating validation here would leave ordinary merges untested.
 on:
   pull_request:
     types: [closed]
@@ -21,7 +27,7 @@ jobs:
           BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           if [[ ! "$BRANCH" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Branch '$BRANCH' is not X.Y.Z - nothing to release."
+            echo "Branch '$BRANCH' is not X.Y.Z - validating only, nothing to release."
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
             echo "Releasing $BRANCH as v$BRANCH"
@@ -30,11 +36,11 @@ jobs:
           fi
 
       - uses: actions/checkout@v7
-        if: steps.ver.outputs.release == 'true'
         with:
-          # Tag the actual merge commit, not whatever master points at later.
+          # Validate and tag the actual merge commit, not whatever master points at later.
           ref: ${{ github.event.pull_request.merge_commit_sha }}
 
+      # Cheap, and before a build is spent on something that cannot be published.
       - name: Refuse to re-release an existing tag
         if: steps.ver.outputs.release == 'true'
         env:
@@ -47,26 +53,29 @@ jobs:
           fi
 
       - uses: actions/setup-java@v6
-        if: steps.ver.outputs.release == 'true'
         with:
           distribution: temurin
           java-version: '25'
           cache: sbt
 
       - uses: sbt/setup-sbt@v1
-        if: steps.ver.outputs.release == 'true'
 
       # NOTE: sbt 2 runs a background server that captures the environment when it
-      # starts, and later `sbt` invocations are thin clients that reuse it. The
-      # first sbt step therefore needs the same env as the publish step, or the
-      # server comes up with no RELEASE_VERSION and no credentials.
+      # starts, and later `sbt` invocations are thin clients that reuse it. This step
+      # therefore needs the same env as the publish step, or the server comes up with
+      # no RELEASE_VERSION and no credentials.
+      #
+      # On a non-release merge RELEASE_VERSION is the empty string; build.sbt treats
+      # empty as absent and falls back to the snapshot version.
       - name: Validate
-        if: steps.ver.outputs.release == 'true'
         env:
           RELEASE_VERSION: ${{ steps.ver.outputs.version }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: sbt -batch -v validate
 
+      # No recompile happens here: the sbt server started by Validate still holds the
+      # compiled classes, so `release` only has to publish them.
+      #
       # Publish before tagging: a tag pointing at an unpublished commit is worse
       # than a published artifact whose tag needs re-adding by hand.
       # `release`, not `publish`: it refuses to push a snapshot, so a missing
