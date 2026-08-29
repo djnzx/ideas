@@ -127,16 +127,22 @@ jobs:
       # The only step that runs in all three cases. This IS case 2 and case 3.
       #
       #   IN   RELEASE_VERSION  version from step 1; EMPTY in cases 2 and 3, which
-      #                         build.sbt treats as absent -> 0.1.0-SNAPSHOT
+      #                         build.sbt treats as absent and lets sbt-dynver derive one
+      #                         from git instead (e.g. 1.0.4+1-a860b45)
       #        GITHUB_TOKEN     credentials for GitHub Packages
       #        source           from step 2, tools from steps 4 and 5
       #   OUT  nothing readable. Fails the job on unformatted code or a failing test.
       #        Side effect that matters: leaves an sbt server holding compiled classes.
       #
-      # NOTE: sbt 2 runs a background server that captures the environment when it
-      # starts, and later `sbt` invocations are thin clients that reuse it. This step
-      # therefore needs the same env as step 7, or the server comes up with no
-      # RELEASE_VERSION and no credentials.
+      # NOTE: this env block is the one that actually counts, even for step 7. sbt 2 runs
+      # a background server that snapshots the environment when it STARTS, and later
+      # `sbt` invocations are thin clients reusing it -- so whatever is set here is what
+      # the build reads for the rest of the job.
+      #
+      # Removing RELEASE_VERSION from this step therefore breaks the release, even though
+      # step 7 sets it: measured, the publish then fails with
+      #   refusing to publish 1.0.4+0-1c2c7bdc+... as a release -- RELEASE_VERSION is not set
+      # The variable is not needed to validate; it is needed here so step 7 inherits it.
       - name: Validate
         env:
           RELEASE_VERSION: ${{ steps.step1.outputs.version }}
@@ -144,14 +150,25 @@ jobs:
         run: sbt -batch -v validate
 
       # === STEP 7 ===================================================== release only ==
-      #   IN   same env as step 6 (deliberately -- see the note there)
-      #        the compiled classes still held by step 6's sbt server, so NO RECOMPILE
+      #   IN   the compiled classes still held by step 6's sbt server, so NO RECOMPILE
+      #        RELEASE_VERSION / GITHUB_TOKEN -- see the note below
       #   OUT  the artifact, published to GitHub Packages
+      #
+      # The env: block below is normally DEAD. This step is a thin client attached to the
+      # server step 6 started, and that server already snapshotted its own environment --
+      # measured: with the server started without RELEASE_VERSION, a client exporting it
+      # is ignored and the build still reports the git-derived version.
+      #
+      # It is kept anyway, because it is the only thing that makes this step correct on
+      # its own. If the server ever is not already running -- it died, someone inserted a
+      # `sbt shutdown`, a future sbt drops the thin-client reuse, or this step moves to
+      # another job -- then sbt starts a fresh server here and reads exactly these values.
+      # Deleting them would leave a step that works only by relying on its neighbour.
       #
       # Publish before tagging: a tag pointing at an unpublished commit is worse than
       # a published artifact whose tag needs re-adding by hand.
-      # `release`, not `publish`: it refuses to push a snapshot, so a missing
-      # RELEASE_VERSION fails loudly instead of publishing 0.1.0-SNAPSHOT.
+      # `release`, not `publish`: it refuses to publish unless RELEASE_VERSION is set,
+      # so a missing variable fails loudly instead of shipping a dynver snapshot string.
       - name: Publish to GitHub Packages
         if: steps.step1.outputs.release == 'true'
         env:
