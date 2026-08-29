@@ -27,6 +27,5 @@ jobs:
       # from project/build.properties (2.0.8).
       - uses: sbt/setup-sbt@v1
 
-      # `validate` = full test suite + scalafmt checks, in that order.
-      # (Plain `test` would be wrong here: in sbt 2 it means `testQuick`.)
+      # `validate` = scalafmt checks + full test suite, in that order.
       - run: sbt -batch -v validate
