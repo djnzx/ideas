@@ -5,36 +5,44 @@ organization := "io.jnz"
 
 // Releases are cut from a branch named X.Y.Z; the release workflow passes that
 // through as RELEASE_VERSION. Everything else is a snapshot.
-//
-// `.filter(_.nonEmpty)` matters: the workflow validates non-release merges too, and
-// there RELEASE_VERSION is set to the empty string rather than left unset. A plain
-// getOrElse would hand back "" and the build would carry an empty version.
-// Version resolution: RELEASE_VERSION wins when set, otherwise sbt-dynver derives one
-// from git. dynver would normally own `version` outright; this override keeps its value
-// as the fallback while letting the release workflow pin an exact number.
-//
-//   RELEASE_VERSION=1.2.3   -> 1.2.3
-//   clean, on tag v1.0.4    -> 1.0.4
-//   commits past the tag    -> 1.0.4+3-1c2c7bd
-//   dirty working tree      -> 1.0.4+0-1c2c7bd+20260829-2130
-//   no tags at all          -> 0.0.0+1-1c2c7bd
-// `dynver` itself is a TaskKey and `version` is a SettingKey, so it cannot be referenced
-// here -- "a setting cannot depend on a task". DynVer's own object computes the same
-// string eagerly, which is what dynver's default definition uses internally.
 ThisBuild / version :=
   sys.env
     .get("RELEASE_VERSION")
     .filter(_.nonEmpty)
     .getOrElse(sbtdynver.DynVer.version(new java.util.Date))
 
-// Declares how to read this project's version numbers, so downstream tooling can tell a
-// compatible bump from a breaking one instead of guessing. Without it, `publish` warns.
-//
-//   early-semver  0.1.0 -> 0.1.1 is compatible, 0.1.x -> 0.2.0 may break;
-//                 from 1.0.0 on, plain semver. The Scala ecosystem default.
-//   semver-spec   strict semver: everything below 1.0.0 is unstable, any bump may break.
-//   pvp           Haskell's Package Versioning Policy.
 ThisBuild / versionScheme := Some("early-semver")
+
+enablePlugins(BuildInfoPlugin)
+
+buildInfoPackage := "io.jnz.example.build"
+
+// `version` is the resolved one -- RELEASE_VERSION when the workflow set it, otherwise dynver's
+// git-derived string. gitCommit is not redundant with it: a release build's version is a plain
+// "1.2.3" with the sha stripped out, and that is exactly the jar you most want to trace back.
+buildInfoKeys := Seq[BuildInfoKey](
+  name,
+  organization,
+  version,
+  scalaVersion,
+  sbtVersion,
+  // BuildInfoKey.action re-runs on every compile, unlike a plain key which is read once at load.
+  // That matters here: commit and dirtiness change under sbt without a reload.
+  BuildInfoKey.action("gitCommit")(git("rev-parse", "HEAD").getOrElse("unknown")),
+  BuildInfoKey.action("gitDirty")(git("status", "--porcelain").exists(_.nonEmpty))
+)
+
+buildInfoOptions ++= Seq(
+  BuildInfoOption.BuildTime, // adds builtAtMillis: Long and builtAtString: String (builder's local zone)
+  BuildInfoOption.ToMap,     // adds toMap: Map[String, Any]
+  BuildInfoOption.ToJson     // adds toJson: String, hand-rolled -- pulls in no json library
+)
+
+/** Shells out to git, returning None if git is missing, this is not a repo, or the call fails.
+  * Every caller has a fallback, so a source tarball with no .git still builds.
+  */
+def git(args: String*): Option[String] =
+  scala.util.Try(scala.sys.process.Process("git" +: args).!!.trim).toOption
 
 // GitHub Packages. Credentials come from the workflow's GITHUB_TOKEN.
 publishTo := Some(MavenRepository("GitHub Packages", "https://maven.pkg.github.com/djnzx/ideas"))

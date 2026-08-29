@@ -37,6 +37,33 @@ open target/readme.html
 | Registry URL | [GitHub Packages](https://github.com/djnzx/ideas/packages)                |
 | Scala        | `2.13.18`                                                                 |
 
+### Build metadata
+
+Every jar carries a generated `io.jnz.example.build.BuildInfo`, so a client can ask which build
+it is actually running instead of inferring it from a filename:
+
+```scala
+import io.jnz.example.build.BuildInfo
+
+BuildInfo.version       // "1.0.5"        the published version
+BuildInfo.gitCommit     // "4b75cead..."  the commit it was built from
+BuildInfo.gitDirty      // false          true only for an uncommitted local build
+BuildInfo.builtAtString // "2026-08-29 23:13:59.182+0300"
+BuildInfo.organization  // "io.jnz"
+BuildInfo.name          // "ideas"
+BuildInfo.scalaVersion  // "2.13.18"
+BuildInfo.sbtVersion    // "2.0.8"
+BuildInfo.toMap         // all of the above as Map[String, Any]
+BuildInfo.toJson        // all of the above as one JSON string
+```
+
+`gitCommit` is the field worth knowing about: a *released* jar's `version` is a plain
+`1.0.5` with the sha stripped out, so this is the only thing tying the artifact back to
+a commit. Snapshot builds keep it in the version string as well (`1.0.5+3-4b75cead`).
+
+It is an ordinary compiled object — no reflection, no manifest parsing, and it adds
+nothing to your classpath.
+
 Everything below is about getting that dependency to resolve.
 
 
@@ -578,31 +605,53 @@ required status check on the `master` branch protection rule.
 
 `master-ci` covers three cases, and validates in all of them:
 
-| What happened                         | Event          | Result                                   |
-|---------------------------------------|----------------|------------------------------------------|
-| Merged PR from a branch named `X.Y.Z` | `pull_request` | validate + publish + tag + delete branch |
-| Merged PR from any other branch       | `pull_request` | validate only                            |
-| Direct push to `master`               | `push`         | validate only                            |
+| What happened                         | How `master-ci` recognises it                | Result                                   |
+|---------------------------------------|----------------------------------------------|------------------------------------------|
+| Merged PR from a branch named `X.Y.Z` | one merged PR into `master`, head `X.Y.Z`    | validate + publish + tag + delete branch |
+| Merged PR from any other branch       | one merged PR into `master`, some other head | validate only                            |
+| Direct push to `master`               | no merged PR associated with the commit      | validate only                            |
 
 The branch-name check is anchored, so a near miss fails safe — `v0.1.3`, `0.1`,
 `0.1.3.4`, `0.1.3-rc1` and `release/0.1.3` all validate and publish nothing, rather
 than publishing under a version you did not mean.
 
-### Why `master-ci` listens to two events
+### Why `master-ci` listens only to `push`
 
-`pull_request` carries the source branch as `head.ref`, which is what the version is
-read from. `push` carries no branch information at all, so it can only ever mean
-"validate". Both are needed because a direct push fires only the second.
+A merge into `master` emits **two** events — `pull_request: closed` and `push`. An
+earlier version of this workflow listened to both and paid for it: every merge built
+twice, once per event.
 
-Deriving the branch from the commit instead — and dropping to a single `push`
-trigger — does not work here: this repository squash-merges, so a merge commit has
-one parent and a PR-title subject, indistinguishable from a direct push. Both
-after-the-fact lookups were tried against real history and both failed on a genuine
-merge commit, because master was rewritten and GitHub still associates the PR with
-the original sha. A heuristic that silently skips a release is not worth the saved
-minutes.
+It now listens to `push: branches: [master]` and nothing else. That one event covers
+every path into `master` — a merge and a direct push alike — so dropping `pull_request`
+loses no coverage.
 
-**The cost:** a merge fires *both* events, so it builds twice. Once branch protection
-makes direct pushes impossible, delete the `push` trigger from `master.yml` and the
-duplicate goes with it — every path into `master` stays covered, because the only
-one that needed `push` can no longer happen.
+What it does lose is the PR payload. A `push` event carries no branch information at
+all, and the branch name *is* the version, so step 1 asks GitHub for it:
+
+```
+GET /repos/{owner}/{repo}/commits/{sha}/pulls
+```
+
+filtered to entries with `merged_at != null` and `base.ref == "master"`. No match means
+a direct push — validate only. Exactly one match yields `head.ref`, the version, and
+`head.repo.full_name`, which the cleanup step needs so it does not try to delete a
+branch living in someone's fork. More than one match fails the job instead of guessing.
+
+**Squash-merging does not break this.** It does break every *git-side* attempt: this
+repository squash-merges, so a commit on `master` has one parent and a PR-title subject,
+indistinguishable from a direct push by inspecting history alone. The association is not
+derived from git, though — GitHub records it server-side and hands it back for the
+squashed commit. Checked against `4b75cea`, the commit that made this change:
+
+```console
+$ gh api repos/djnzx/ideas/commits/4b75cea/pulls \
+    --jq '[.[] | {number, merged_at, base: .base.ref, head: .head.ref}]'
+[{"base":"master","head":"1.0.8","merged_at":"2026-08-29T19:49:45Z","number":9}]
+```
+
+and end to end in the run that commit triggered — a `push` event that resolved `1.0.8`,
+published, tagged `v1.0.8`, and deleted the branch.
+
+**The cost** is two lines the `pull_request` version did not need: `pull-requests: read`
+in the `permissions` block, and `GH_TOKEN` in step 1's `env`. Reading that endpoint is
+an authenticated API call, where `head.ref` used to be a free field on the event payload.
