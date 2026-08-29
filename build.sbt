@@ -38,3 +38,32 @@ libraryDependencies ++= Seq(
   /** colored & informative output */
   "com.lihaoyi"       %% "pprint"          % "0.9.6"
 )
+
+lazy val precommit = taskKey[Unit]("Run before committing: formats everything, then runs all tests.")
+
+// Sequential, so formatting lands before anything compiles.
+// Uncached because sbt 2 hashes task results and testFull's TestResult has no HashWriter --
+// without it the build will not even load.
+precommit := Def.uncached(
+  Def
+    .sequential(
+      scalafmtAll,
+      Compile / scalafmtSbt,
+      Test / testFull
+    )
+    .value
+)
+
+lazy val validate = taskKey[Unit]("For CI: fails on unformatted code, then runs all tests. Never rewrites a file.")
+
+// Sequential, cheapest check first: no point compiling and running the suite for a
+// tree that will be rejected over whitespace. Uncached also.
+validate := Def.uncached(
+  Def
+    .sequential(
+      scalafmtCheckAll,
+      Compile / scalafmtSbtCheck,
+      Test / testFull
+    )
+    .value
+)
