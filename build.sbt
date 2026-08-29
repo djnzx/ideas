@@ -1,7 +1,21 @@
 Global / onChangedBuildSource := ReloadOnSourceChanges
 
 name := "ideas"
-version := "0.1.0"
+organization := "io.jnz"
+
+// Releases are cut from a branch named X.Y.Z; the release workflow passes that
+// through as RELEASE_VERSION. Everything else is a snapshot.
+version := sys.env.getOrElse("RELEASE_VERSION", "0.1.0-SNAPSHOT")
+
+// GitHub Packages. Credentials come from the workflow's GITHUB_TOKEN.
+publishTo := Some(MavenRepository("GitHub Packages", "https://maven.pkg.github.com/djnzx/ideas"))
+
+credentials += Credentials(
+  "GitHub Package Registry",
+  "maven.pkg.github.com",
+  sys.env.getOrElse("GITHUB_ACTOR", ""),
+  sys.env.getOrElse("GITHUB_TOKEN", "")
+)
 
 scalaVersion := "2.13.18"
 
@@ -64,6 +78,22 @@ validate := Def.uncached(
       scalafmtCheckAll,
       Compile / scalafmtSbtCheck,
       Test / testFull
+    )
+    .value
+)
+
+lazy val release = taskKey[Unit]("For CI: publishes to GitHub Packages. Refuses to publish a snapshot.")
+
+// Guards publishing rather than `version`, so local compile/test still work on the
+// snapshot default. Uncached for the same reason as the tasks above.
+release := Def.uncached(
+  Def
+    .sequential(
+      Def.task {
+        if (isSnapshot.value)
+          sys.error(s"refusing to publish ${version.value} as a release -- RELEASE_VERSION is not set")
+      },
+      publish
     )
     .value
 )
