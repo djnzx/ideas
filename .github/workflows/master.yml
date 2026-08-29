@@ -6,11 +6,9 @@ name: master-ci
 #   2. merged PR from any other branch             -> validate
 #   3. direct push                                 -> validate
 #
-# Cases 1 and 2 come from the `pull_request` event, which carries the source branch
-# as `head.ref`. Case 3 comes from the `push` event, which does not carry it at all.
-#
-# COST: a merge fires both events, so it builds twice. Once branch protection makes
-# direct pushes impossible, delete the `push` trigger below and the duplicate with it.
+# A merge emits both `pull_request: closed` and `push`. Listening only for `push` keeps
+# this to one run. Because that event has no PR payload, step 1 asks GitHub which merged
+# PR introduced this commit and gets the source branch from that response.
 #
 # ---------------------------------------------------------------------------------
 # HOW DATA MOVES BETWEEN STEPS
@@ -25,77 +23,82 @@ name: master-ci
 # ---------------------------------------------------------------------------------
 
 on:
-  pull_request:
-    types: [closed]
+  push:
+    branches: [master]
 
-# Serialise same-kind runs so two merges cannot publish out of order. Never cancel:
+# Serialise runs so two merges cannot publish out of order. Never cancel:
 # a cancelled run could leave a tag without an artifact.
 concurrency:
-  group: master-${{ github.event_name }}
+  group: master
   cancel-in-progress: false
 
 # Declaring this block at all sets EVERY unlisted scope to `none` -- it is deny-by-default,
 # not "add these on top of the defaults".
 #
-# `actions: write` is declared because this job's post-steps do attempt cache writes.
-# It does NOT make them succeed: a run with `Actions: write` confirmed in its own
-# "GITHUB_TOKEN Permissions" group still logs
-#   Failed to save: ... cache write denied: token has no writable scopes
-#
-# The cause is the event, not the token. Actions caches are scoped to the ref that
-# wrote them, and a `pull_request: closed` run's ref is the PR merge ref, which is gone
-# by the time the job runs -- so the scope is not writable. non-master.yml saves fine
-# because a push runs against a real branch ref.
-#
-# Consequence: harmless. Restores still work here (53 MB restored, measured), and
-# non-master.yml refreshes the cache on every branch push. The warning is noise.
+# The cache service issues its own runtime token, independently of this block. A `push`
+# to master is allowed to save the sbt/coursier caches; `actions: write` is neither
+# needed nor sufficient for cache writes.
 permissions:
   contents: write # push the tag
   packages: write # publish to GitHub Packages
-  actions: write  # save the sbt/coursier cache in the post steps
+  pull-requests: read # find the PR that introduced this pushed commit
 
 jobs:
   master:
-    # Push: always. Pull request: only a merge into master, not a close-without-merge.
-    if: >-
-      github.event_name == 'push' ||
-      (github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'master')
     runs-on: ubuntu-latest
     steps:
       # === STEP 1 =====================================================================
       # Decides whether this run is a release. Every gated step below reads its output.
       #
-      #   IN   EVENT   "push" or "pull_request"      (github.event_name)
-      #        BRANCH  source branch of the PR       (empty string on a push)
+      #   IN   SHA     pushed commit (github.sha)
+      #        API     GitHub's PR associated-with-commit endpoint
       #   OUT  release "true" | "false"              -> gates steps 3, 7, 8, 9
       #        version "X.Y.Z"                       -> only written when release=true
+      #        branch / fork                         -> needed to clean up a release branch
       #
       # `id: step1` is what makes these readable later as steps.step1.outputs.release .
       # The id is an arbitrary handle, not a keyword; it matches the STEP banners above.
-      - name: Release, or validate only?
+      - name: Discover release data
         id: step1
         env:
-          EVENT: ${{ github.event_name }}
-          BRANCH: ${{ github.event.pull_request.head.ref }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
-          if [[ "$EVENT" != "pull_request" ]]; then
+          set -euo pipefail
+
+          pr="$(gh api "repos/$REPO/commits/$SHA/pulls" | jq -c '
+            [.[] | select(.merged_at != null and .base.ref == "master")]
+            | if length == 0 then empty
+              elif length == 1 then .[0]
+              else error("more than one merged PR is associated with this commit")
+              end
+          ')"
+
+          if [[ -z "$pr" ]]; then
             echo "Direct push to master - validating only."
             echo "release=false" >> "$GITHUB_OUTPUT"
-          elif [[ ! "$BRANCH" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Merged from '$BRANCH', which is not X.Y.Z - validating only."
+            exit 0
+          fi
+
+          branch="$(jq -r '.head.ref' <<<"$pr")"
+          fork="$(jq -r '.head.repo.full_name // ""' <<<"$pr")"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "fork=$fork" >> "$GITHUB_OUTPUT"
+
+          if [[ ! "$branch" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Merged from '$branch', which is not X.Y.Z - validating only."
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Merged from '$BRANCH' - releasing as v$BRANCH"
+            echo "Merged from '$branch' - releasing as v$branch"
             echo "release=true"    >> "$GITHUB_OUTPUT"
-            echo "version=$BRANCH" >> "$GITHUB_OUTPUT"
+            echo "version=$branch" >> "$GITHUB_OUTPUT"
           fi
 
       # === STEP 2 =====================================================================
       # Puts the source code on the runner. Nothing before this can read a file.
       #
-      #   IN   ref          which commit to check out. The `A && B || C` idiom is an
-      #                     if-then-else: on a pull_request take merge_commit_sha,
-      #                     on a push take github.sha.
+      #   IN   ref          the pushed commit (github.sha)
       #        fetch-depth  0 means full history AND tags -- step 3 needs the tags.
       #   OUT  the working directory
       - name: Check out the commit to build
@@ -103,7 +106,7 @@ jobs:
         with:
           fetch-depth: 0
           # Validate and tag the actual merge commit, not whatever master points at later.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha || github.sha }}
+          ref: ${{ github.sha }}
 
       # === STEP 3 ===================================================== release only ==
       # Cheap, and before a build is spent on something that cannot be published.
@@ -140,9 +143,9 @@ jobs:
         uses: sbt/setup-sbt@v1
 
       # === STEP 6 ================================================== always, all cases ==
-      # The only step that runs in all three cases. This IS case 2 and case 3.
+      # The only step that runs for every push: a direct push or a non-release merge.
       #
-      #   IN   RELEASE_VERSION  version from step 1; EMPTY in cases 2 and 3, which
+      #   IN   RELEASE_VERSION  version from step 1; EMPTY in validation-only cases, which
       #                         build.sbt treats as absent and lets sbt-dynver derive one
       #                         from git instead (e.g. 1.0.4+1-a860b45)
       #        GITHUB_TOKEN     credentials for GitHub Packages
@@ -223,8 +226,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event.pull_request.head.ref }}
-          FORK: ${{ github.event.pull_request.head.repo.full_name }}
+          BRANCH: ${{ steps.step1.outputs.branch }}
+          FORK: ${{ steps.step1.outputs.fork }}
         run: |
           if [[ "$FORK" != "$REPO" ]]; then
             echo "Head branch lives in $FORK, not $REPO - leaving it alone."
