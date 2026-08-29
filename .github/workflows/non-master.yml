@@ -1,0 +1,100 @@
+name: non-master-ci
+
+# Every commit on every branch except master. `branches-ignore` matches nested names
+# like `feature/foo` while leaving tag pushes alone -- a tag push is not a branch push,
+# so the release tag this repo creates never retriggers a build.
+#
+# master is handled by master.yml.
+#
+# One job, run top to bottom. An earlier attempt split the tag check into its own job
+# with `needs:`, but jobs get a fresh runner each and share nothing, so that paid two
+# runner allocations and two checkouts on EVERY push to save a build only on the rare
+# push whose branch name was already taken. Flat is cheaper and fails just as early:
+# step 2 rejects a doomed branch before any JDK or sbt is installed.
+#
+# To block the merge button rather than just show red, mark this job a required status
+# check on the master branch protection rule. The context to select is the JOB name,
+# `validate`, not the workflow name -- and requiring it means the tests passed too,
+# not merely that the version is free.
+on:
+  push:
+    branches-ignore: ['master']
+
+# A newer commit on the same branch supersedes an in-flight run.
+concurrency:
+  group: non-master-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      # === STEP 1 =====================================================================
+      #   IN   fetch-depth: 0  no limit: full history and every tag.
+      #
+      # Not optional. The default is 1 -- a shallow clone of just the tip commit, which
+      # carries only the tags pointing AT that commit. Verified against this repo: a
+      # depth-1 clone finds v0.1.2 (it tags the tip) but NOT v0.1.1, whose commit is
+      # outside the shallow history. Step 2 would then report the tag free and wave a
+      # colliding branch through -- a false pass, the dangerous direction to be wrong in.
+      #   OUT  the working directory
+      - name: Check out the branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # === STEP 2 =====================================================================
+      # A version branch is a promise to publish X.Y.Z. Published versions are immutable
+      # and tags are not reused, so if vX.Y.Z already exists the branch can never be
+      # released -- and learning that only AFTER the merge leaves a merged commit that
+      # has to be re-branched under a new number.
+      #
+      # master.yml keeps its own copy of this check as a backstop: a tag could still
+      # appear in the window between this passing and the merge landing.
+      #
+      #   IN   BRANCH  the branch being pushed (github.ref_name)
+      #        tags    fetched by step 1
+      #   OUT  nothing. Exits non-zero to FAIL THE WHOLE JOB, which stops steps 3-5 --
+      #        so a doomed branch never costs a compile or a test run.
+      - name: Refuse a version branch whose tag already exists
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$BRANCH" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Branch '$BRANCH' is not a version branch - nothing to check."
+            exit 0
+          fi
+          TAG="v$BRANCH"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists, so branch '$BRANCH' can never be released. Bump the version and rename the branch."
+            exit 1
+          fi
+          echo "$TAG is free - '$BRANCH' can be released."
+
+      # === STEP 3 =====================================================================
+      #   IN   distribution / java-version  which JDK to install
+      #        cache: sbt                   restores ~/.sbt and the coursier cache
+      #   OUT  a JDK on PATH, plus a warm dependency cache for step 5
+      - name: Install the JDK and restore the sbt cache
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: sbt
+
+      # === STEP 4 =====================================================================
+      #   IN   nothing -- the sbt version comes from project/build.properties (2.0.8)
+      #   OUT  `sbt` on PATH
+      #
+      # sbt is no longer preinstalled on the runners.
+      - name: Install sbt
+        uses: sbt/setup-sbt@v1
+
+      # === STEP 5 =====================================================================
+      #   IN   source from step 1, tools from steps 3 and 4
+      #   OUT  nothing. Fails the job on unformatted code or a failing test.
+      #
+      # `validate` = scalafmtCheckAll + scalafmtSbtCheck + testFull, in that order:
+      # the cheapest check first, so a whitespace problem does not cost a test run.
+      - name: Validate
+        run: sbt -batch -v validate

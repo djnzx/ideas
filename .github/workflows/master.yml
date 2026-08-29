@@ -1,0 +1,205 @@
+name: master-ci
+
+# Everything that lands on master, however it got there:
+#
+#   1. merged PR from a branch named exactly X.Y.Z -> validate + publish + tag
+#   2. merged PR from any other branch             -> validate
+#   3. direct push                                 -> validate
+#
+# Cases 1 and 2 come from the `pull_request` event, which carries the source branch
+# as `head.ref`. Case 3 comes from the `push` event, which does not carry it at all.
+#
+# COST: a merge fires both events, so it builds twice. Once branch protection makes
+# direct pushes impossible, delete the `push` trigger below and the duplicate with it.
+#
+# ---------------------------------------------------------------------------------
+# HOW DATA MOVES BETWEEN STEPS
+#
+#   env:            values handed TO a step, readable as shell variables ($EVENT)
+#   $GITHUB_OUTPUT  a file a step appends `key=value` lines to
+#   steps.<id>.outputs.<key>
+#                   how every LATER step reads those values
+#   if:             a step runs only when this is true; skipped steps are not failures
+#
+# Only step 1 has an `id`, because it is the only step other steps read from.
+# ---------------------------------------------------------------------------------
+
+on:
+  push:
+    branches: ['master']
+  pull_request:
+    types: [closed]
+
+# Serialise same-kind runs so two merges cannot publish out of order. Never cancel:
+# a cancelled run could leave a tag without an artifact.
+concurrency:
+  group: master-${{ github.event_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the tag
+  packages: write # publish to GitHub Packages
+
+jobs:
+  master:
+    # Push: always. Pull request: only a merge into master, not a close-without-merge.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'master')
+    runs-on: ubuntu-latest
+    steps:
+      # === STEP 1 =====================================================================
+      # Decides whether this run is a release. Every gated step below reads its output.
+      #
+      #   IN   EVENT   "push" or "pull_request"      (github.event_name)
+      #        BRANCH  source branch of the PR       (empty string on a push)
+      #   OUT  release "true" | "false"              -> gates steps 3, 7, 8, 9
+      #        version "X.Y.Z"                       -> only written when release=true
+      #
+      # `id: step1` is what makes these readable later as steps.step1.outputs.release .
+      # The id is an arbitrary handle, not a keyword; it matches the STEP banners above.
+      - name: Release, or validate only?
+        id: step1
+        env:
+          EVENT: ${{ github.event_name }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if [[ "$EVENT" != "pull_request" ]]; then
+            echo "Direct push to master - validating only."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          elif [[ ! "$BRANCH" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Merged from '$BRANCH', which is not X.Y.Z - validating only."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Merged from '$BRANCH' - releasing as v$BRANCH"
+            echo "release=true"    >> "$GITHUB_OUTPUT"
+            echo "version=$BRANCH" >> "$GITHUB_OUTPUT"
+          fi
+
+      # === STEP 2 =====================================================================
+      # Puts the source code on the runner. Nothing before this can read a file.
+      #
+      #   IN   ref          which commit to check out. The `A && B || C` idiom is an
+      #                     if-then-else: on a pull_request take merge_commit_sha,
+      #                     on a push take github.sha.
+      #        fetch-depth  0 means full history AND tags -- step 3 needs the tags.
+      #   OUT  the working directory
+      - name: Check out the commit to build
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # Validate and tag the actual merge commit, not whatever master points at later.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha || github.sha }}
+
+      # === STEP 3 ===================================================== release only ==
+      # Cheap, and before a build is spent on something that cannot be published.
+      #
+      #   IN   TAG   "v" + version from step 1
+      #        tags  fetched by step 2
+      #   OUT  nothing. Exits non-zero to FAIL THE WHOLE JOB if the tag already exists,
+      #        which stops steps 4-9 from running.
+      - name: Refuse to re-release an existing tag
+        if: steps.step1.outputs.release == 'true'
+        env:
+          TAG: v${{ steps.step1.outputs.version }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists."
+            exit 1
+          fi
+
+      # === STEP 4 =====================================================================
+      #   IN   distribution / java-version  which JDK to install
+      #        cache: sbt                   restores ~/.sbt and the coursier cache
+      #   OUT  a JDK on PATH, plus a warm dependency cache for steps 6 and 7
+      - name: Install the JDK and restore the sbt cache
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: sbt
+
+      # === STEP 5 =====================================================================
+      #   IN   nothing -- the sbt version comes from project/build.properties (2.0.8)
+      #   OUT  `sbt` on PATH
+      - name: Install sbt
+        uses: sbt/setup-sbt@v1
+
+      # === STEP 6 ================================================== always, all cases ==
+      # The only step that runs in all three cases. This IS case 2 and case 3.
+      #
+      #   IN   RELEASE_VERSION  version from step 1; EMPTY in cases 2 and 3, which
+      #                         build.sbt treats as absent -> 0.1.0-SNAPSHOT
+      #        GITHUB_TOKEN     credentials for GitHub Packages
+      #        source           from step 2, tools from steps 4 and 5
+      #   OUT  nothing readable. Fails the job on unformatted code or a failing test.
+      #        Side effect that matters: leaves an sbt server holding compiled classes.
+      #
+      # NOTE: sbt 2 runs a background server that captures the environment when it
+      # starts, and later `sbt` invocations are thin clients that reuse it. This step
+      # therefore needs the same env as step 7, or the server comes up with no
+      # RELEASE_VERSION and no credentials.
+      - name: Validate
+        env:
+          RELEASE_VERSION: ${{ steps.step1.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: sbt -batch -v validate
+
+      # === STEP 7 ===================================================== release only ==
+      #   IN   same env as step 6 (deliberately -- see the note there)
+      #        the compiled classes still held by step 6's sbt server, so NO RECOMPILE
+      #   OUT  the artifact, published to GitHub Packages
+      #
+      # Publish before tagging: a tag pointing at an unpublished commit is worse than
+      # a published artifact whose tag needs re-adding by hand.
+      # `release`, not `publish`: it refuses to push a snapshot, so a missing
+      # RELEASE_VERSION fails loudly instead of publishing 0.1.0-SNAPSHOT.
+      - name: Publish to GitHub Packages
+        if: steps.step1.outputs.release == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.step1.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GITHUB_ACTOR is set by GitHub already
+        run: sbt -batch -v release
+
+      # === STEP 8 ===================================================== release only ==
+      #   IN   TAG  "v" + version from step 1
+      #   OUT  an annotated tag pushed to origin, on the commit step 2 checked out
+      #
+      # The name is static on purpose: an interpolated name renders as a bare "Tag v"
+      # in the log whenever this step is skipped, since version is empty then. The
+      # actual tag is echoed by the step instead.
+      - name: Tag the release
+        if: steps.step1.outputs.release == 'true'
+        env:
+          TAG: v${{ steps.step1.outputs.version }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+          echo "Tagged $TAG"
+
+      # === STEP 9 ===================================================== release only ==
+      #   IN   BRANCH  the merged PR's source branch
+      #        FORK    which repo that branch lives in -- a fork's branch is not ours
+      #        REPO / GH_TOKEN  target and credentials for the delete call
+      #   OUT  the release branch removed from origin
+      #
+      # Last step on purpose: steps fail the job on first error, so the branch is only
+      # removed once validate, publish and tag have all succeeded.
+      - name: Delete the release branch
+        if: steps.step1.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          FORK: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [[ "$FORK" != "$REPO" ]]; then
+            echo "Head branch lives in $FORK, not $REPO - leaving it alone."
+          elif gh api "repos/$REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH"
+            echo "Deleted $BRANCH"
+          else
+            echo "Branch $BRANCH is already gone (repo auto-delete may be on)."
+          fi
