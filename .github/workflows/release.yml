@@ -85,5 +85,24 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "Release $TAG"
+          git tag -a "$TAG" -m "$TAG"
           git push origin "$TAG"
+
+      # Last step on purpose: steps fail the job on first error, so the branch is
+      # only removed once validate, publish and tag have all succeeded.
+      - name: Delete the release branch
+        if: steps.ver.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          FORK: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [[ "$FORK" != "$REPO" ]]; then
+            echo "Head branch lives in $FORK, not $REPO - leaving it alone."
+          elif gh api "repos/$REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH"
+            echo "Deleted $BRANCH"
+          else
+            echo "Branch $BRANCH is already gone (repo auto-delete may be on)."
+          fi
