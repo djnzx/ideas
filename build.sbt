@@ -19,26 +19,27 @@ credentials += Credentials(
 
 scalaVersion := "2.13.18"
 
+// only for Java code in the repo, must match scala release
 javacOptions := Seq("-source", "17", "-target", "17")
 
+// Full list of flags: https://docs.scala-lang.org/overviews/compiler-options/index.html
 scalacOptions ++= Seq(
-  "-encoding",
+  "-release:17",                           // target JVM 17 bytecode + JDK 17 API
+  "-encoding",                             // source file encoding, value on next line
   "UTF-8",
-  "-feature",
-  "-deprecation",
-  "-unchecked",
-  "-language:postfixOps",
-  "-language:higherKinds",
-  "-language:existentials",
-  "-Wconf:cat=other-match-analysis:error",
-  "-Wunused",
-  //  "-Xfatal-warnings",
-  "-Ymacro-annotations",
-  "-Ywarn-numeric-widen",
-  "-Ywarn-value-discard",
-  "-Ywarn-dead-code",
-  //  "-Ywarn-unused",
-  "-Yrepl-class-based"
+  "-feature",                              // warn where an explicit import is needed
+  "-deprecation",                          // warn on deprecated API usage
+  "-unchecked",                            // warn on type tests erasure cannot check
+  "-language:postfixOps",                  // allow `xs tail` without an import
+  "-language:higherKinds",                 // allow F[_] type parameters
+  "-language:existentials",                // allow T forSome { ... } types
+  "-Wconf:cat=other-match-analysis:error", // non-exhaustive match is an error
+  "-Wunused",                              // warn on unused imports, locals, params
+  //  "-Xfatal-warnings", // promote every warning to an error
+  "-Ymacro-annotations",                   // enable macro annotation expansion
+  "-Ywarn-numeric-widen",                  // warn on implicit Int -> Long widening
+  "-Ywarn-value-discard",                  // warn when a non-Unit value is dropped
+  "-Ywarn-dead-code"                       // warn on unreachable code
 )
 
 libraryDependencies ++= Seq(
