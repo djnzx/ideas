@@ -9,7 +9,32 @@ organization := "io.jnz"
 // `.filter(_.nonEmpty)` matters: the workflow validates non-release merges too, and
 // there RELEASE_VERSION is set to the empty string rather than left unset. A plain
 // getOrElse would hand back "" and the build would carry an empty version.
-version := sys.env.get("RELEASE_VERSION").filter(_.nonEmpty).getOrElse("0.1.0-SNAPSHOT")
+// Version resolution: RELEASE_VERSION wins when set, otherwise sbt-dynver derives one
+// from git. dynver would normally own `version` outright; this override keeps its value
+// as the fallback while letting the release workflow pin an exact number.
+//
+//   RELEASE_VERSION=1.2.3   -> 1.2.3
+//   clean, on tag v1.0.4    -> 1.0.4
+//   commits past the tag    -> 1.0.4+3-1c2c7bd
+//   dirty working tree      -> 1.0.4+0-1c2c7bd+20260829-2130
+//   no tags at all          -> 0.0.0+1-1c2c7bd
+// `dynver` itself is a TaskKey and `version` is a SettingKey, so it cannot be referenced
+// here -- "a setting cannot depend on a task". DynVer's own object computes the same
+// string eagerly, which is what dynver's default definition uses internally.
+ThisBuild / version :=
+  sys.env
+    .get("RELEASE_VERSION")
+    .filter(_.nonEmpty)
+    .getOrElse(sbtdynver.DynVer.version(new java.util.Date))
+
+// Declares how to read this project's version numbers, so downstream tooling can tell a
+// compatible bump from a breaking one instead of guessing. Without it, `publish` warns.
+//
+//   early-semver  0.1.0 -> 0.1.1 is compatible, 0.1.x -> 0.2.0 may break;
+//                 from 1.0.0 on, plain semver. The Scala ecosystem default.
+//   semver-spec   strict semver: everything below 1.0.0 is unstable, any bump may break.
+//   pvp           Haskell's Package Versioning Policy.
+ThisBuild / versionScheme := Some("early-semver")
 
 // GitHub Packages. Credentials come from the workflow's GITHUB_TOKEN.
 publishTo := Some(MavenRepository("GitHub Packages", "https://maven.pkg.github.com/djnzx/ideas"))
@@ -95,7 +120,11 @@ release := Def.uncached(
   Def
     .sequential(
       Def.task {
-        if (isSnapshot.value)
+        // Guard on the env var, not isSnapshot. Since `version` now falls back to a
+        // git-derived one, a clean checkout sitting exactly on a tag produces a
+        // NON-snapshot version (v9.9.9 -> 9.9.9), which an isSnapshot check would wave
+        // straight through to publish. Only an explicit RELEASE_VERSION should publish.
+        if (!sys.env.get("RELEASE_VERSION").exists(_.nonEmpty))
           sys.error(s"refusing to publish ${version.value} as a release -- RELEASE_VERSION is not set")
       },
       publish
