@@ -1,11 +1,23 @@
-import scala.collection.Seq
-
 Global / onChangedBuildSource := ReloadOnSourceChanges
 
-name := "scala-template"
-version := "0.0.1"
+name := "ideas"
+organization := "io.jnz"
 
-scalaVersion := "2.13.14"
+// Releases are cut from a branch named X.Y.Z; the release workflow passes that
+// through as RELEASE_VERSION. Everything else is a snapshot.
+version := sys.env.getOrElse("RELEASE_VERSION", "0.1.0-SNAPSHOT")
+
+// GitHub Packages. Credentials come from the workflow's GITHUB_TOKEN.
+publishTo := Some(MavenRepository("GitHub Packages", "https://maven.pkg.github.com/djnzx/ideas"))
+
+credentials += Credentials(
+  "GitHub Package Registry",
+  "maven.pkg.github.com",
+  sys.env.getOrElse("GITHUB_ACTOR", ""),
+  sys.env.getOrElse("GITHUB_TOKEN", "")
+)
+
+scalaVersion := "2.13.18"
 
 javacOptions := Seq("-source", "17", "-target", "17")
 
@@ -31,39 +43,57 @@ scalacOptions ++= Seq(
 
 libraryDependencies ++= Seq(
   /** some useful plugin things */
-  compilerPlugin("org.typelevel" %% "kind-projector"     % "0.13.3" cross CrossVersion.full),
-  compilerPlugin("com.olegpy"    %% "better-monadic-for" % "0.3.1"),
-  /** basic category things */
-  "org.typelevel"     %% "cats-core"               % "2.12.0",
-  /** effects */
-  "org.typelevel"     %% "cats-effect"             % "3.5.4",
-  "co.fs2"            %% "fs2-io"                  % "3.10.2",
-  /** json serialization */
-  "io.circe"          %% "circe-parser"            % "0.14.9",
-  "io.circe"          %% "circe-generic-extras"    % "0.14.4",
-  /** http */
-  "org.http4s"        %% "http4s-dsl"              % "0.23.27",
-  "org.http4s"        %% "http4s-circe"            % "0.23.27",
-  "org.http4s"        %% "http4s-blaze-server"     % "0.23.16",
-  "org.http4s"        %% "http4s-blaze-client"     % "0.23.16",
-  /** PostgresSQL */
-  "org.tpolecat"      %% "doobie-postgres"         % "1.0.0-RC5",
-  "org.tpolecat"      %% "doobie-hikari"           % "1.0.0-RC5",
-  "org.tpolecat"      %% "skunk-core"              % "0.6.4",
-  "org.postgresql"     % "postgresql"              % "42.7.3",
-  /** kafka */
-  "com.github.fd4s"   %% "fs2-kafka"               % "3.5.1",
-  /** enum support */
-  "com.beachape"      %% "enumeratum"              % "1.7.4",
-  "com.beachape"      %% "enumeratum-circe"        % "1.7.4",
-  "com.beachape"      %% "enumeratum-doobie"       % "1.7.6", // doobie: 1.0.0-RC5
-  "com.beachape"      %% "enumeratum-cats"         % "1.7.4",
-  "com.beachape"      %% "enumeratum-scalacheck"   % "1.7.4",
+  compilerPlugin(("org.typelevel" %% "kind-projector" % "0.13.4").cross(CrossVersion.full)),
+  compilerPlugin("com.olegpy" %% "better-monadic-for" % "0.3.1"),
   /** testing */
-  "org.scalatest"     %% "scalatest"               % "3.2.19",
-  "org.scalacheck"    %% "scalacheck"              % "1.18.0",
-  "org.scalatestplus" %% "scalacheck-1-18"         % "3.2.19.0",
-  "org.mockito"       %% "mockito-scala-scalatest" % "1.17.37",
+  "org.scalatest"     %% "scalatest"       % "3.2.20"   % Test,
+  "org.scalacheck"    %% "scalacheck"      % "1.20.0"   % Test,
+  "org.scalatestplus" %% "scalacheck-1-19" % "3.2.20.0" % Test,
   /** colored & informative output */
-  "com.lihaoyi"       %% "pprint"                  % "0.9.0"
+  "com.lihaoyi"       %% "pprint"          % "0.9.6"
+)
+
+lazy val precommit = taskKey[Unit]("Run before committing: formats everything, then runs all tests.")
+
+// Sequential, so formatting lands before anything compiles.
+// Uncached because sbt 2 hashes task results and testFull's TestResult has no HashWriter --
+// without it the build will not even load.
+precommit := Def.uncached(
+  Def
+    .sequential(
+      scalafmtAll,
+      Compile / scalafmtSbt,
+      Test / testFull
+    )
+    .value
+)
+
+lazy val validate = taskKey[Unit]("For CI: fails on unformatted code, then runs all tests. Never rewrites a file.")
+
+// Sequential, cheapest check first: no point compiling and running the suite for a
+// tree that will be rejected over whitespace. Uncached also.
+validate := Def.uncached(
+  Def
+    .sequential(
+      scalafmtCheckAll,
+      Compile / scalafmtSbtCheck,
+      Test / testFull
+    )
+    .value
+)
+
+lazy val release = taskKey[Unit]("For CI: publishes to GitHub Packages. Refuses to publish a snapshot.")
+
+// Guards publishing rather than `version`, so local compile/test still work on the
+// snapshot default. Uncached for the same reason as the tasks above.
+release := Def.uncached(
+  Def
+    .sequential(
+      Def.task {
+        if (isSnapshot.value)
+          sys.error(s"refusing to publish ${version.value} as a release -- RELEASE_VERSION is not set")
+      },
+      publish
+    )
+    .value
 )
