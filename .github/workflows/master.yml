@@ -35,10 +35,20 @@ concurrency:
   cancel-in-progress: false
 
 # Declaring this block at all sets EVERY unlisted scope to `none` -- it is deny-by-default,
-# not "add these on top of the defaults". `actions: write` is here because the Actions
-# cache service needs it to SAVE (restores work without it), and omitting it produced:
+# not "add these on top of the defaults".
+#
+# `actions: write` is declared because this job's post-steps do attempt cache writes.
+# It does NOT make them succeed: a run with `Actions: write` confirmed in its own
+# "GITHUB_TOKEN Permissions" group still logs
 #   Failed to save: ... cache write denied: token has no writable scopes
-# non-master.yml declares no permissions block at all, which is why its cache saves fine.
+#
+# The cause is the event, not the token. Actions caches are scoped to the ref that
+# wrote them, and a `pull_request: closed` run's ref is the PR merge ref, which is gone
+# by the time the job runs -- so the scope is not writable. non-master.yml saves fine
+# because a push runs against a real branch ref.
+#
+# Consequence: harmless. Restores still work here (53 MB restored, measured), and
+# non-master.yml refreshes the cache on every branch push. The warning is noise.
 permissions:
   contents: write # push the tag
   packages: write # publish to GitHub Packages
