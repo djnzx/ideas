@@ -34,9 +34,15 @@ concurrency:
   group: master-${{ github.event_name }}
   cancel-in-progress: false
 
+# Declaring this block at all sets EVERY unlisted scope to `none` -- it is deny-by-default,
+# not "add these on top of the defaults". `actions: write` is here because the Actions
+# cache service needs it to SAVE (restores work without it), and omitting it produced:
+#   Failed to save: ... cache write denied: token has no writable scopes
+# non-master.yml declares no permissions block at all, which is why its cache saves fine.
 permissions:
   contents: write # push the tag
   packages: write # publish to GitHub Packages
+  actions: write  # save the sbt/coursier cache in the post steps
 
 jobs:
   master:
